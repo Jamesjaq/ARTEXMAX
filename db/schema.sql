@@ -339,6 +339,40 @@ CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id)
     WHERE kind='result';
 CREATE INDEX IF NOT EXISTS idx_act_latest ON activity(exploration_id, created_at DESC);
 
+-- Durable control-plane ledger. Events are append-only; large tool output and
+-- screenshots stay in evidence storage and are referenced from payload JSON.
+CREATE TABLE IF NOT EXISTS run_events (
+    id               BIGSERIAL PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    parent_id        BIGINT REFERENCES run_events(id),
+    kind             TEXT NOT NULL,
+    schema_version   INTEGER NOT NULL DEFAULT 1,
+    source           TEXT NOT NULL DEFAULT '',
+    idempotency_key  TEXT,
+    payload          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_run_events_idempotency
+    ON run_events(run_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_run_events_stream
+    ON run_events(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_run_events_kind
+    ON run_events(run_id, kind, id);
+
+-- Bounded resumable projections. State must contain compact references rather
+-- than raw transcripts or unbounded tool output.
+CREATE TABLE IF NOT EXISTS run_checkpoints (
+    id               BIGSERIAL PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    parent_event_id  BIGINT REFERENCES run_events(id),
+    step             TEXT NOT NULL,
+    state_version    INTEGER NOT NULL DEFAULT 1,
+    state            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_run_checkpoints_latest
+    ON run_checkpoints(run_id, id DESC);
+
 -- main_sessions records the resettable main-agent conversation segments of a task.
 -- Segment 0 (the original session) is implicit and never stored; this table holds
 -- only the extra segments created by "new session" (seq >= 1). The current segment is
