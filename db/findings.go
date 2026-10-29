@@ -84,6 +84,7 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if assetIDs == nil {
 		aidsJSON = []byte("[]")
 	}
+	identity := FindingIdentity(vulnclass, "artex/v1", "", evidence, assetIDs)
 	var tid, nid *int64
 	if taskID > 0 {
 		tid = &taskID
@@ -93,9 +94,9 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	}
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, identity_key)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), identity,
 	).Scan(&id)
 	return id, err
 }

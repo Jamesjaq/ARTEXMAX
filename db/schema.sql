@@ -373,6 +373,22 @@ CREATE TABLE IF NOT EXISTS run_checkpoints (
 CREATE INDEX IF NOT EXISTS idx_run_checkpoints_latest
     ON run_checkpoints(run_id, id DESC);
 
+-- Durable worker ownership for intent execution. The fencing token increases
+-- whenever ownership changes, so a delayed worker cannot write after lease
+-- expiry and reacquisition. The graph node remains the business state; this
+-- table is the short-lived execution-ownership projection.
+CREATE TABLE IF NOT EXISTS intent_leases (
+    intent_id      BIGINT PRIMARY KEY REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    owner          TEXT NOT NULL,
+    fencing_token  BIGINT NOT NULL,
+    heartbeat_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at     TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intent_leases_expiry ON intent_leases(expires_at);
+CREATE INDEX IF NOT EXISTS idx_intent_leases_exploration ON intent_leases(exploration_id, intent_id);
+
 -- main_sessions records the resettable main-agent conversation segments of a task.
 -- Segment 0 (the original session) is implicit and never stored; this table holds
 -- only the extra segments created by "new session" (seq >= 1). The current segment is
@@ -1138,14 +1154,26 @@ CREATE TABLE IF NOT EXISTS findings (
     status      TEXT NOT NULL DEFAULT 'pending',
     -- The detailed finding report (Markdown); empty by default, read and shown only on the detail page and kept out of the list endpoint so the payload does not balloon.
     report      TEXT NOT NULL DEFAULT '',
+    -- Stable machine identity is derived from the rule/class, normalized asset
+    -- location, evidence fingerprint, and engine version; it never uses LLM prose.
+    identity_key TEXT NOT NULL DEFAULT '',
+    lifecycle_state TEXT NOT NULL DEFAULT 'introduced',
+    last_verified_at TIMESTAMPTZ,
+    verification_runs INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS identity_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'introduced';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_runs INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_findings_identity ON findings(identity_key, created_at DESC)
+    WHERE identity_key <> '';
 -- The "by asset" view looks findings up with asset_ids @> '[<id>]', which is a full table scan without this GIN index.
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
 

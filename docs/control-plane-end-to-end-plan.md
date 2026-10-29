@@ -21,6 +21,25 @@ go test ./agent ./db ./intercept ./evidence ./llmpool
 
 The complete suite additionally requires PostgreSQL because existing server integration tests open a configured ARTEX database.
 
+## Latest implementation slice
+
+Durable intent ownership is now wired into worker execution. `intent_leases`
+stores the owner, expiry, heartbeat, and monotonic fencing token. Frontier and
+detached chat claims acquire a lease; long worker runs heartbeat it; settlement
+state changes use a token-checked compare-and-set; and cleanup/restart paths
+release or reclaim expired leases. A stale worker therefore cannot complete or
+reopen an intent after another worker has taken ownership. The remaining work
+still includes wiring the deterministic action-policy evaluator into every
+executor, provider cost accounting, signed check profiles, and restart/replay
+fixture episodes. The evaluator itself now validates tool/capability allowlists,
+target scope, action/byte/deadline budgets, and exact approval digests.
+Signed passive profiles are implemented with version checks, HMAC verification,
+GET/HEAD/OPTIONS-only enforcement, credential-header rejection, bounded body
+and time limits, and authentication-aware request deduplication.
+The runner executes these profiles with per-request timeouts, response-size
+caps, redirect controls, normalized observations, truncation metadata, and
+per-run request deduplication.
+
 ## End-to-end target architecture
 
 The runtime should follow this invariant:
