@@ -157,8 +157,17 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 	if params == nil {
 		params = map[string]any{}
 	}
+	action, err := customToolAction("test", req.Kind, req.Exec, params)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
+	if _, err := customToolAuthorization(ctx, action); err != nil {
+		writeErr(w, 403, err.Error())
+		return
+	}
 	tc := &actool.ToolContext{WorkingDir: s.m.dir} // run in the project dir, like a real call
 	var res actool.Result
 	switch req.Kind {
@@ -195,8 +204,10 @@ func detectPython() string {
 // pythonInterpreter resolves the interpreter: user-set > stored auto-detect > live
 // detect. "" only when truly none found.
 func (s *Server) pythonInterpreter() string {
-	if v, ok, _ := s.m.pg.GetSetting(settingPythonInterp); ok && strings.TrimSpace(v) != "" {
-		return strings.TrimSpace(v)
+	if s != nil && s.m != nil && s.m.pg != nil {
+		if v, ok, _ := s.m.pg.GetSetting(settingPythonInterp); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
 	}
 	return detectPython()
 }
@@ -272,6 +283,13 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 		}
 		if params == nil {
 			params = map[string]any{}
+		}
+		action, actionErr := customToolAction(key, kind, execRaw, params)
+		if actionErr != nil {
+			return actool.Errorf(normalizeCustomOutput(tc, actionErr.Error())), nil
+		}
+		if _, policyErr := customToolAuthorization(ctx, action); policyErr != nil {
+			return actool.Errorf(normalizeCustomOutput(tc, policyErr.Error())), nil
 		}
 		switch kind {
 		case "command":
@@ -370,7 +388,7 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	if err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
-	return actool.Text(actool.Capture(tc, body)), nil
+	return actool.Text(normalizeCustomOutput(tc, body)), nil
 }
 
 // execPython writes the code to a temp .py under workDir/.tools, runs it via interp
@@ -451,9 +469,9 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	out := map[string]any{"status": resp.StatusCode, "body": string(respBody)}
+	out := map[string]any{"status": resp.StatusCode, "body": redactCustomOutput(string(respBody))}
 	b, _ := json.Marshal(out)
-	return actool.Text(actool.Capture(tc, string(b))), nil
+	return actool.Text(normalizeCustomOutput(tc, string(b))), nil
 }
 
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil

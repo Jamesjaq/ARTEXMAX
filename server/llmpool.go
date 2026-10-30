@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -52,6 +53,59 @@ func newLLMHealthRegistry(pg *db.DB) *llmpool.Registry {
 		}
 	}
 	return reg
+}
+
+// initLLMProviderTelemetry installs one bounded async writer shared by every
+// provider pool. Telemetry is best-effort: a slow database cannot stall model
+// calls, and a full queue drops the row with a warning instead of growing memory
+// without bound.
+func (s *Server) initLLMProviderTelemetry() {
+	if s.m == nil || s.m.pg == nil {
+		return
+	}
+	queue := make(chan db.LLMProviderTelemetry, 256)
+	s.llmTelemetrySink = func(ev llmpool.TelemetryEvent) {
+		row := db.LLMProviderTelemetry{
+			TaskID: ev.TaskID, Worker: ev.Worker, Role: ev.Role, Kind: ev.Kind,
+			MemberID: ev.MemberID, ProfileName: ev.ProfileName, Model: ev.Model,
+			FallbackFrom: ev.FallbackFromProfile, FallbackTo: ev.FallbackToProfile,
+			LatencyMs: ev.LatencyMs, InputTokens: ev.Usage.InputTokens,
+			OutputTokens: ev.Usage.OutputTokens, CacheRead: ev.Usage.CacheReadTokens,
+			CacheWrite: ev.Usage.CacheWriteTokens, EstimatedCostMicros: ev.EstimatedCostMicros,
+			BudgetDecision: ev.BudgetDecision, Status: ev.Status, Error: ev.Error,
+		}
+		select {
+		case queue <- row:
+		default:
+			log.Printf("[llmpool] provider telemetry queue full; dropping %q event for profile %q", ev.Kind, ev.ProfileName)
+		}
+	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		persist := func(row db.LLMProviderTelemetry) {
+			if err := s.m.pg.InsertLLMProviderTelemetry(&row); err != nil {
+				log.Printf("[llmpool] failed to persist provider telemetry: %v", err)
+			}
+		}
+		for {
+			select {
+			case row := <-queue:
+				persist(row)
+			case <-ctx.Done():
+				for {
+					select {
+					case row := <-queue:
+						persist(row)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
 }
 
 // poolMember builds one chain member from a profile, reusing the per-profile
@@ -122,7 +176,9 @@ func (s *Server) poolChain(headID int64, headProv llm.Provider, headCfg agent.Co
 	if len(members) < 2 {
 		return nil // nothing to fail over to
 	}
-	return llmpool.New(members, s.llmHealth)
+	pool := llmpool.New(members, s.llmHealth)
+	pool.SetTelemetrySink(s.llmTelemetrySink)
+	return pool
 }
 
 // poolForActive wraps the globally-active provider in the failover chain. Returns

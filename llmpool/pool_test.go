@@ -110,6 +110,65 @@ func TestFailoverOnNoCredit(t *testing.T) {
 	}
 }
 
+func TestPoolEmitsAttemptAndFallbackTelemetry(t *testing.T) {
+	a, b := failProv("a", 402), okProv("b", "hello")
+	p := New([]*Member{member(1, "a", 10, a), member(2, "b", 5, b)}, NewRegistry(nil, nil))
+	var events []TelemetryEvent
+	p.SetTelemetrySink(func(event TelemetryEvent) { events = append(events, event) })
+
+	ctx := WithTelemetryContext(context.Background(), "task-17", "worker", "planner")
+	if _, err := drain(p.Stream(ctx, llm.CompletionRequest{})); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events=%d, want attempt/fallback/attempt: %#v", len(events), events)
+	}
+	if events[0].Kind != "attempt" || events[0].ProfileName != "a" || events[0].Status != "error" || events[0].Error != "provider status 402" {
+		t.Fatalf("first attempt telemetry = %#v", events[0])
+	}
+	if strings.Contains(events[0].Error, "nope") {
+		t.Fatalf("provider response text leaked into telemetry error: %q", events[0].Error)
+	}
+	if events[1].Kind != "fallback" || events[1].FallbackFromProfile != "a" || events[1].FallbackToProfile != "b" {
+		t.Fatalf("fallback telemetry = %#v", events[1])
+	}
+	if events[2].Kind != "attempt" || events[2].ProfileName != "b" || events[2].Status != "ok" {
+		t.Fatalf("successful attempt telemetry = %#v", events[2])
+	}
+	for _, event := range events {
+		if event.TaskID != "task-17" || event.Worker != "worker" || event.Role != "planner" {
+			t.Fatalf("missing telemetry context: %#v", event)
+		}
+	}
+}
+
+func TestPoolCompleteTelemetryIncludesUsage(t *testing.T) {
+	failed := failProv("a", 503)
+	served := &fakeProv{name: "b", events: [][]llm.StreamEvent{{
+		{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 7, CacheReadTokens: 2}},
+		{Type: llm.SETextDelta, Text: "answer"},
+		{Type: llm.SEMessageDelta, Usage: llm.Usage{OutputTokens: 3}},
+	}}}
+	p := New([]*Member{member(1, "a", 10, failed), member(2, "b", 5, served)}, NewRegistry(nil, nil))
+	var events []TelemetryEvent
+	p.SetTelemetrySink(func(event TelemetryEvent) { events = append(events, event) })
+
+	_, _, usage, err := p.Complete(WithTelemetryContext(context.Background(), "task-18", "worker", "verifier"), llm.CompletionRequest{})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if usage.InputTokens != 7 || usage.OutputTokens != 3 || usage.CacheReadTokens != 2 {
+		t.Fatalf("returned usage = %#v", usage)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events=%d, want 3: %#v", len(events), events)
+	}
+	last := events[2]
+	if last.Kind != "attempt" || last.ProfileName != "b" || last.Usage.InputTokens != 7 || last.Usage.OutputTokens != 3 || last.Usage.CacheReadTokens != 2 {
+		t.Fatalf("successful call telemetry = %#v", last)
+	}
+}
+
 // A 402 is deterministic: one failure must open the breaker, so the NEXT request
 // skips that profile entirely instead of paying for another round-trip.
 func TestHardFailureTripsBreakerImmediately(t *testing.T) {

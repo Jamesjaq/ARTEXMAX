@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_llm_usage_task  ON llm_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
+
+CREATE TABLE IF NOT EXISTS llm_provider_telemetry (
+ id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL DEFAULT now(), task_id TEXT, worker TEXT, role TEXT, kind TEXT NOT NULL,
+ member_id BIGINT, profile_name TEXT, model TEXT, fallback_from TEXT, fallback_to TEXT, latency_ms INTEGER,
+ input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
+ estimated_cost_micros BIGINT NOT NULL DEFAULT 0, budget_decision TEXT, status TEXT, error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_provider_telemetry_task ON llm_provider_telemetry(task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_provider_telemetry_profile ON llm_provider_telemetry(profile_name, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_provider_telemetry_kind ON llm_provider_telemetry(kind, ts DESC);
 `
 
 // EnsureLLMUsageTable creates the llm_usage metering table if it does not exist.

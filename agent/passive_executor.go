@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -16,8 +15,6 @@ import (
 // deduplication local to one run so repeated checks cannot amplify traffic.
 type PassiveRunner struct {
 	Client httpDoer
-	mu     sync.Mutex
-	seen   map[string]struct{}
 }
 
 type httpDoer interface {
@@ -37,14 +34,14 @@ func NewPassiveRunner(client httpDoer) *PassiveRunner {
 	if client == nil {
 		client = &http.Client{}
 	}
-	return &PassiveRunner{Client: client, seen: make(map[string]struct{})}
+	return &PassiveRunner{Client: client}
 }
 
 func (r *PassiveRunner) Run(ctx context.Context, profile PassiveProfile, secret []byte, authContext string) ([]Observation, error) {
 	if err := profile.Verify(secret); err != nil {
 		return nil, err
 	}
-	return r.runVerified(ctx, profile, authContext, nil), nil
+	return r.runVerified(ctx, profile, authContext, nil, make(map[string]struct{})), nil
 }
 
 // RunAuthorized is the control-plane entry point for passive execution. Each
@@ -68,8 +65,21 @@ func (r *PassiveRunner) RunAuthorized(ctx context.Context, profile PassiveProfil
 		Decisions:    make([]PolicyDecision, 0, len(profile.Checks)),
 		Usage:        usage,
 	}
+	seen := make(map[string]struct{}, len(profile.Checks))
 	for _, check := range profile.Checks {
-		action, err := passiveAction(check, authContext)
+		runCheck := check
+		if policy.MaxBytes > 0 {
+			remaining := policy.MaxBytes - result.Usage.Bytes
+			if remaining < runCheck.MaxBodyBytes {
+				runCheck.MaxBodyBytes = remaining
+			}
+		}
+		if runCheck.MaxBodyBytes <= 0 {
+			result.Decisions = append(result.Decisions, PolicyDecision{Allowed: false, Reason: "byte budget exhausted"})
+			result.Observations = append(result.Observations, Observation{ActionID: check.ID, Status: "denied", ErrorCode: "policy_denied", Summary: "byte budget exhausted", Redacted: true})
+			continue
+		}
+		action, err := passiveAction(runCheck, authContext)
 		if err != nil {
 			return AuthorizedPassiveRun{}, err
 		}
@@ -86,7 +96,7 @@ func (r *PassiveRunner) RunAuthorized(ctx context.Context, profile PassiveProfil
 			})
 			continue
 		}
-		observations := r.runVerified(ctx, PassiveProfile{Checks: []PassiveCheck{check}}, authContext, &result.Usage)
+		observations := r.runVerified(ctx, PassiveProfile{Checks: []PassiveCheck{runCheck}}, authContext, &result.Usage, seen)
 		result.Observations = append(result.Observations, observations...)
 	}
 	return result, nil
@@ -98,10 +108,13 @@ func passiveAction(check PassiveCheck, authContext string) (Action, error) {
 		return Action{}, err
 	}
 	args, err := json.Marshal(struct {
-		Method  string            `json:"method"`
-		URL     string            `json:"url"`
-		Headers map[string]string `json:"headers,omitempty"`
-	}{strings.ToUpper(check.Method), check.URL, check.Headers})
+		Method          string            `json:"method"`
+		URL             string            `json:"url"`
+		Headers         map[string]string `json:"headers,omitempty"`
+		MaxBodyBytes    int64             `json:"max_body_bytes"`
+		TimeoutMS       int               `json:"timeout_ms"`
+		FollowRedirects bool              `json:"follow_redirects"`
+	}{strings.ToUpper(check.Method), check.URL, check.Headers, check.MaxBodyBytes, check.TimeoutMS, check.FollowRedirects})
 	if err != nil {
 		return Action{}, err
 	}
@@ -118,24 +131,23 @@ func passiveAction(check PassiveCheck, authContext string) (Action, error) {
 	}, nil
 }
 
-func (r *PassiveRunner) runVerified(ctx context.Context, profile PassiveProfile, authContext string, usage *PolicyUsage) []Observation {
+func (r *PassiveRunner) runVerified(ctx context.Context, profile PassiveProfile, authContext string, usage *PolicyUsage, seen map[string]struct{}) []Observation {
 	out := make([]Observation, 0, len(profile.Checks))
 	for _, check := range profile.Checks {
 		key := PassiveRequestKey(check, authContext)
-		r.mu.Lock()
-		_, duplicate := r.seen[key]
+		_, duplicate := seen[key]
 		if !duplicate {
-			r.seen[key] = struct{}{}
+			seen[key] = struct{}{}
 		}
-		r.mu.Unlock()
 		if duplicate {
+			out = append(out, Observation{ActionID: check.ID, Status: "skipped", Summary: "duplicate request skipped", Redacted: true})
 			continue
 		}
 		obs := r.runCheck(ctx, check)
 		out = append(out, obs)
 		if usage != nil {
 			usage.Actions++
-			usage.Bytes += obs.BytesRead
+			usage.Bytes += obs.BytesStored
 		}
 	}
 	return out
@@ -157,9 +169,21 @@ func (r *PassiveRunner) runCheck(ctx context.Context, check PassiveCheck) Observ
 		req.Header.Set(key, value)
 	}
 	client := r.Client
-	if base, ok := client.(*http.Client); ok && !check.FollowRedirects {
+	if base, ok := client.(*http.Client); ok {
 		clone := *base
-		clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+		originScheme, originHost := strings.ToLower(req.URL.Scheme), strings.ToLower(req.URL.Host)
+		clone.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if !check.FollowRedirects {
+				return http.ErrUseLastResponse
+			}
+			if len(via) == 0 || strings.ToLower(next.URL.Scheme) != originScheme || strings.ToLower(next.URL.Host) != originHost {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= 5 {
+				return fmt.Errorf("redirect limit exceeded")
+			}
+			return nil
+		}
 		client = &clone
 	}
 	resp, err := client.Do(req)
@@ -196,7 +220,17 @@ func (r *PassiveRunner) runCheck(ctx context.Context, check PassiveCheck) Observ
 		obs.Status = "ok"
 		obs.Summary = fmt.Sprintf("HTTP %d; body_bytes=%d", resp.StatusCode, len(body))
 	}
-	obs.ProvenanceNote = fmt.Sprintf("%s %s; status=%d; content_length=%d", req.Method, req.URL.String(), resp.StatusCode, len(body))
+	obs.ProvenanceNote = fmt.Sprintf("%s %s; status=%d; content_length=%d", req.Method, safePassiveURL(req.URL), resp.StatusCode, len(body))
 	obs.Duration = time.Since(started)
 	return obs
+}
+
+func safePassiveURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	copy := *u
+	copy.RawQuery = ""
+	copy.ForceQuery = false
+	return copy.String()
 }

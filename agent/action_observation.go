@@ -70,7 +70,7 @@ func (o Observation) Validate() error {
 		return errors.New("observation action id is required")
 	}
 	switch o.Status {
-	case "ok", "error", "denied", "cancelled", "timeout":
+	case "ok", "error", "denied", "cancelled", "timeout", "skipped":
 	default:
 		return fmt.Errorf("invalid observation status %q", o.Status)
 	}

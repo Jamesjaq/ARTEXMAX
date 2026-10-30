@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const findingIdentityEngineVersion = "artex/v1"
+
 const (
 	FindingLifecycleIntroduced        = "introduced"
 	FindingLifecyclePersistent        = "persistent"

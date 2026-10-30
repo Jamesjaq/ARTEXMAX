@@ -381,9 +381,10 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	if assets == nil {
 		assets = []int64{}
 	}
+	identity := FindingIdentity(in.VulnClass, findingIdentityEngineVersion, "", in.Evidence, assets)
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,identity_key)
+	VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// Register a notification event in the **same transaction**: committing then guarantees "the

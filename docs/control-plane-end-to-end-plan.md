@@ -4,56 +4,37 @@ This document is the execution plan for turning the initial control-plane slice 
 
 ## Current checkpoint
 
-The repository now contains:
+**Status: useful control-plane primitives exist, but this is not yet a complete end-to-end runtime.** The checkout is based on `f9727e05880d10f43b19f9e6b4de4f18802e3683`; the continuation changes remain uncommitted and unpushed.
 
-- `db/run_ledger.go`: append-only run events with parent IDs and idempotency keys, plus versioned run checkpoints.
-- `db/schema.sql`: idempotent `run_events` and `run_checkpoints` tables and indexes.
-- `agent/action_observation.go`: typed action and observation contracts with safety/bounds validation.
-- `agent/context_budget.go`: deterministic context selection with mandatory items, output/safety reservations, ranking, and dropped-item reasons.
-- Unit tests for the new contracts and context selection.
+### Verified in this continuation
 
-The current focused test command is:
+- `llmpool.BudgetedProvider` now applies its reserved output cap to the provider request, rejects uncapped calls when a hard output/total/cost budget cannot bound them, checks actual input/output/total-token usage after completion, retains actual usage when an overrun is reported, and counts advertised tool schemas in the default request estimate. `MaxOutputPerCallTokens` provides a bound for requests whose `MaxTokens` is zero.
+- Budget tests now assert the specific denial reasons and cover uncapped-request rejection, effective output caps, actual token overruns, actual cost overruns, and streaming usage.
+- The production `RecordFindingTx` path used by `report_finding` now persists a stable normalized `identity_key`, using the same version tag as the legacy `AddFinding` path. A PostgreSQL-backed regression test verifies presentation-only changes do not change this identity.
+- The recovered passive-profile and custom-tool changes remain in the worktree. Their focused tests pass; the passive HTTP runner has a typed `RunAuthorized` policy-gated entry point, but that does not establish universal policy enforcement for all tools.
+
+### Validation
+
+The following completed successfully:
 
 ```bash
-export PATH=/usr/local/go/bin:$PATH
-go test ./agent ./db ./intercept ./evidence ./llmpool
+go test ./agent ./db ./intercept ./evidence ./llmpool ./guard ./traffic
+go test ./server -run 'CustomTool'
+go vet ./llmpool
+git diff --check
 ```
 
-The complete suite additionally requires PostgreSQL because existing server integration tests open a configured ARTEX database.
+`go test ./...` ran all packages but the `server` package's PostgreSQL-backed integration tests failed during setup because neither `ARTEX_PG_DSN` nor a database section in `server/config.json` is available in this environment. Those checks are **unverified here**, not evidence of a code regression. The new database-backed finding-identity regression likewise requires PostgreSQL and was not exercised. No live target, provider, or external service was called.
 
-## Latest implementation slice
+### Confirmed remaining integration gaps
 
-Durable intent ownership is now wired into worker execution. `intent_leases`
-stores the owner, expiry, heartbeat, and monotonic fencing token. Frontier and
-detached chat claims acquire a lease; long worker runs heartbeat it; settlement
-state changes use a token-checked compare-and-set; and cleanup/restart paths
-release or reclaim expired leases. A stale worker therefore cannot complete or
-reopen an intent after another worker has taken ownership. The remaining work
-still includes wiring the deterministic action-policy evaluator into every
-executor, provider cost accounting, signed check profiles, and restart/replay
-fixture episodes. The evaluator itself now validates tool/capability allowlists,
-target scope, action/byte/deadline budgets, and exact approval digests.
-Signed passive profiles are implemented with version checks, HMAC verification,
-GET/HEAD/OPTIONS-only enforcement, credential-header rejection, bounded body
-and time limits, and authentication-aware request deduplication.
-The runner executes these profiles with per-request timeouts, response-size
-caps, redirect controls, normalized observations, truncation metadata, and
-per-run request deduplication. `RunAuthorized` is now the typed policy-gated
-entry point: each check becomes an exact `http_request`/`http.read` action,
-`EvaluateAction` runs before the HTTP client is touched, denied checks produce
-auditable denied observations, and allowed checks update action/byte usage.
-The low-level `Run` method remains only for callers that already own an
-external authorization boundary; orchestration should migrate to
-`RunAuthorized`.
-
-The provider layer now also exposes explicit role routes (`reasoner`,
-`summarizer`, `extractor`, and `verifier`) and a concurrency-safe budget
-decorator. It reserves in-flight input/output capacity before a call, commits
-actual usage on completion, releases reservations on failure, and enforces
-token and microcurrency ceilings. The replay layer includes a deterministic
-run-event projection with duplicate ID/idempotency suppression, and the
-fixture episode harness exercises policy evaluation, bounded observation, and
-completion events against an authorized local target.
+- `db/run_ledger.go` and run checkpoint APIs have no production callers. Intent leases are used for claim/heartbeat/settlement, but ordinary worker graph writes are not fenced by the lease token; startup recovery is not replay from the new event ledger/checkpoint.
+- `agent.BuildContext` is a tested helper only. Planner, worker, main/goal, compaction, and auxiliary model paths do not all pass through one bounded, auditable context builder.
+- The action-policy evaluator and signed passive checks are not a universal pre-execution gate. Approval storage/configuration, scope policy, and audit events are not composed across every executor.
+- `llmpool.Route` and `BudgetedProvider` remain library primitives without server-level role routing or per-run/tenant budget configuration. Pricing rates are not configured; provider cost telemetry is therefore incomplete, and telemetry coverage is mostly failover-pool calls.
+- Finding identity is now written on the primary report path, but finding lifecycle transitions and bounded provenance validation are not wired into production. Raw captured traffic remains distinct from a redacted/bounded model-facing evidence projection.
+- Episode export/restart code and deterministic passive fixtures remain helper/test paths. There is no persistence-backed production episode coordinator, service-restart injection, full event/evidence export, or aggregate episode metrics.
+- The plan's composed create→deny/approve→execute→evidence→restart/resume→finding→export E2E test has not been implemented or run.
 
 ## End-to-end target architecture
 

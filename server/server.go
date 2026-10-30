@@ -106,7 +106,8 @@ type Server struct {
 	// It deliberately lives OUTSIDE the provider caches: rebuilding the chain
 	// (saving an unrelated profile, flipping a setting) must not erase what we
 	// learned about which backends are out of credit / rate-limited.
-	llmHealth *llmpool.Registry
+	llmHealth        *llmpool.Registry
+	llmTelemetrySink llmpool.TelemetrySink
 
 	// Explicit task chains use one task-scoped dynamic provider shared by goals,
 	// planner, workers, and the main agent. Bundles are stable; their runtime reads
@@ -151,6 +152,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.initLLMProviderTelemetry()
 	s.initSideQuestions()
 	// The breaker threshold and cooldown are hot parameters on the failure path, so the global retry
 	// policy is pushed to the Registry once at startup, and again every time the policy is saved (saveLLMRetryPolicy).

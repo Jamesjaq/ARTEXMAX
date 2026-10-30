@@ -84,7 +84,7 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if assetIDs == nil {
 		aidsJSON = []byte("[]")
 	}
-	identity := FindingIdentity(vulnclass, "artex/v1", "", evidence, assetIDs)
+	identity := FindingIdentity(vulnclass, findingIdentityEngineVersion, "", evidence, assetIDs)
 	var tid, nid *int64
 	if taskID > 0 {
 		tid = &taskID

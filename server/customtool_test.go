@@ -6,10 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestRenderTemplateCommand(t *testing.T) {
@@ -183,5 +187,110 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 	out := res.Flatten()
 	if len(out) >= 40000 {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
+	}
+}
+
+func customToolTestAuth(tool, capability, scope string) CustomToolAuthorization {
+	return CustomToolAuthorization{Policy: agent.Policy{
+		Revision:            "test-policy",
+		AllowedTools:        map[string]bool{tool: true},
+		AllowedCapabilities: map[string]bool{capability: true},
+		AllowedScopes:       []string{scope},
+		MaxActions:          1,
+		MaxBytes:            1 << 20,
+	}}
+}
+
+func TestCustomToolActionDigestBindsExecutorSpec(t *testing.T) {
+	params := map[string]any{"target": "example.test"}
+	first, err := customToolAction("probe", "command", json.RawMessage(`{"command":"curl {target}"}`), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := customToolAction("probe", "command", json.RawMessage(`{"command":"curl {target}; touch /tmp/changed"}`), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest, err := agent.ActionDigest(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := agent.ActionDigest(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest == secondDigest {
+		t.Fatal("changing the executor command did not change the approval digest")
+	}
+	if first.IdempotencyKey == second.IdempotencyKey {
+		t.Fatal("changing the executor command did not change the idempotency key")
+	}
+}
+
+func TestCustomHTTPToolDeniedBeforeNetwork(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer srv.Close()
+	tool := (&Server{}).buildCustomTool(&db.Tool{Key: "probe_http", Kind: "http", Exec: json.RawMessage(`{"method":"GET","url":"` + srv.URL + `"}`)})
+	res, err := tool.Call(context.Background(), json.RawMessage(`{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Flatten(), "no policy authorization") {
+		t.Fatalf("expected fail-closed denial, got %+v", res)
+	}
+	if calls != 0 {
+		t.Fatalf("denied HTTP tool executed %d requests", calls)
+	}
+}
+
+func TestCustomHTTPToolAllowedAndRedactsOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"token":"do-not-leak"}`))
+	}))
+	defer srv.Close()
+	spec := json.RawMessage(`{"method":"GET","url":"` + srv.URL + `","timeout_ms":1000}`)
+	tool := (&Server{}).buildCustomTool(&db.Tool{Key: "probe_http", Kind: "http", Exec: spec})
+	u, _ := url.Parse(srv.URL)
+	ctx := WithCustomToolAuthorization(context.Background(), customToolTestAuth("probe_http", "http.get", u.Host))
+	res, err := tool.Call(ctx, json.RawMessage(`{}`), nil)
+	if err != nil || res.IsError {
+		t.Fatalf("allowed HTTP tool failed: %v %+v", err, res)
+	}
+	if strings.Contains(res.Flatten(), "do-not-leak") || !strings.Contains(res.Flatten(), "[REDACTED]") {
+		t.Fatalf("HTTP output was not normalized/redacted: %q", res.Flatten())
+	}
+}
+
+func TestCustomScriptToolDeniedBeforeInterpreter(t *testing.T) {
+	s := &Server{m: &Manager{dir: t.TempDir()}}
+	spec := json.RawMessage(`{"code":"raise SystemExit('must not run')","timeout_ms":1000}`)
+	tool := s.buildCustomTool(&db.Tool{Key: "probe_script", Kind: "script", Exec: spec})
+	res, err := tool.Call(context.Background(), json.RawMessage(`{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Flatten(), "no policy authorization") {
+		t.Fatalf("expected fail-closed script denial, got %+v", res)
+	}
+	if strings.Contains(res.Flatten(), "must not run") {
+		t.Fatal("denied script produced execution output")
+	}
+}
+
+func TestCustomScriptToolAllowedBoundedAndRedactsOutput(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 unavailable")
+	}
+	s := &Server{m: &Manager{dir: t.TempDir()}}
+	spec := json.RawMessage(`{"code":"print('{\"token\":\"do-not-leak\",\"ok\":true}')","timeout_ms":1000}`)
+	tool := s.buildCustomTool(&db.Tool{Key: "probe_script", Kind: "script", Exec: spec})
+	ctx := WithCustomToolAuthorization(context.Background(), customToolTestAuth("probe_script", "custom.script", "local"))
+	res, err := tool.Call(ctx, json.RawMessage(`{}`), nil)
+	if err != nil || res.IsError {
+		t.Fatalf("allowed script tool failed: %v %+v", err, res)
+	}
+	if strings.Contains(res.Flatten(), "do-not-leak") || !strings.Contains(res.Flatten(), "[REDACTED]") {
+		t.Fatalf("script output was not normalized/redacted: %q", res.Flatten())
 	}
 }

@@ -15,6 +15,8 @@ import (
 // executable until EvaluateAction returns allow or an exact approval matches.
 type Policy struct {
 	Revision                      string
+	RunID                         string
+	Checkpoint                    string
 	AllowedTools                  map[string]bool
 	AllowedCapabilities           map[string]bool
 	AllowedScopes                 []string
@@ -57,11 +59,12 @@ func ActionDigest(a Action) (string, error) {
 		return "", err
 	}
 	canonical := struct {
-		Tool, TargetScope, Capability     string
+		ID, Tool, TargetScope, Capability string
+		IdempotencyKey                    string
 		Arguments                         any
 		TimeoutMS                         int
 		ReadOnly, Destructive, Idempotent bool
-	}{a.Tool, a.TargetScope, a.Capability, args, a.TimeoutMS, a.ReadOnly, a.Destructive, a.Idempotent}
+	}{a.ID, a.Tool, a.TargetScope, a.Capability, a.IdempotencyKey, args, a.TimeoutMS, a.ReadOnly, a.Destructive, a.Idempotent}
 	raw, _ := json.Marshal(canonical)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
@@ -73,10 +76,10 @@ func EvaluateAction(a Action, p Policy, usage PolicyUsage, approval *Approval, n
 		return PolicyDecision{Allowed: false, Reason: err.Error()}
 	}
 	deny := func(reason string) PolicyDecision { return PolicyDecision{ActionDigest: digest, Reason: reason} }
-	if p.AllowedTools != nil && !p.AllowedTools[a.Tool] {
+	if len(p.AllowedTools) == 0 || !p.AllowedTools[a.Tool] {
 		return deny("tool is not allowed by policy")
 	}
-	if p.AllowedCapabilities != nil && !p.AllowedCapabilities[a.Capability] {
+	if len(p.AllowedCapabilities) == 0 || !p.AllowedCapabilities[a.Capability] {
 		return deny("capability is not allowed by policy")
 	}
 	if len(p.AllowedScopes) == 0 {
@@ -98,14 +101,19 @@ func EvaluateAction(a Action, p Policy, usage PolicyUsage, approval *Approval, n
 	if p.MaxBytes > 0 && usage.Bytes >= p.MaxBytes {
 		return deny("byte budget exhausted")
 	}
-	if !p.Deadline.IsZero() && now.After(p.Deadline) {
+	if !p.Deadline.IsZero() && !now.Before(p.Deadline) {
 		return deny("policy deadline expired")
 	}
 	if a.Destructive && p.RequireApprovalForDestructive {
+		if strings.TrimSpace(p.RunID) == "" || strings.TrimSpace(p.Checkpoint) == "" {
+			return deny("approval run and checkpoint context is unavailable")
+		}
 		if approval == nil {
 			return PolicyDecision{ActionDigest: digest, NeedsApproval: true, Reason: "exact human approval required"}
 		}
-		if !approval.Allowed || approval.ActionDigest != digest || approval.PolicyRevision != p.Revision || approval.ExpiresAt.Before(now) || strings.TrimSpace(approval.Reviewer) == "" {
+		if !approval.Allowed || approval.ActionDigest != digest || approval.PolicyRevision != p.Revision ||
+			approval.RunID != p.RunID || approval.Checkpoint != p.Checkpoint ||
+			approval.ExpiresAt.IsZero() || !now.Before(approval.ExpiresAt) || strings.TrimSpace(approval.Reviewer) == "" {
 			return deny("approval does not match the exact action and policy revision")
 		}
 	}
@@ -115,6 +123,9 @@ func EvaluateAction(a Action, p Policy, usage PolicyUsage, approval *Approval, n
 func (p Policy) Validate() error {
 	if strings.TrimSpace(p.Revision) == "" {
 		return errors.New("policy revision is required")
+	}
+	if len(p.AllowedTools) == 0 || len(p.AllowedCapabilities) == 0 {
+		return errors.New("policy must explicitly configure tool and capability allowlists")
 	}
 	if p.MaxActions < 0 || p.MaxBytes < 0 {
 		return errors.New("policy budgets cannot be negative")

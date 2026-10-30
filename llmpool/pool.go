@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Autumn-27/norma/llm"
 )
@@ -49,6 +50,69 @@ type Pool struct {
 	members []*Member // in chain order (active first, then priority DESC)
 	health  *Registry
 	rr      atomic.Uint64 // rotates the starting point within an equal-priority group
+	sink    TelemetrySink
+}
+
+// SetTelemetrySink installs an optional best-effort observer.
+func (p *Pool) SetTelemetrySink(sink TelemetrySink) { p.sink = sink }
+
+func (p *Pool) emit(ctx context.Context, ev TelemetryEvent) {
+	if p.sink == nil {
+		return
+	}
+	c := TelemetryContextFrom(ctx)
+	ev.TaskID, ev.Worker, ev.Role = c.TaskID, c.Worker, c.Role
+	p.sink(ev)
+}
+
+func (p *Pool) emitAttempt(ctx context.Context, m *Member, started time.Time, usage llm.Usage, err error, status string) {
+	if status == "" {
+		status = telemetryStatus(err)
+	}
+	event := TelemetryEvent{
+		Kind: "attempt", MemberID: m.ID, ProfileName: m.Name, Model: m.Model,
+		LatencyMs: int(time.Since(started).Milliseconds()), Usage: usage, Status: status,
+	}
+	if err != nil {
+		event.Error = telemetryError(err)
+	}
+	p.emit(ctx, event)
+}
+
+func (p *Pool) emitFallback(ctx context.Context, from, to *Member, err error) {
+	event := TelemetryEvent{
+		Kind: "fallback", FallbackFromProfile: from.Name, FallbackToProfile: to.Name,
+		Status: "switched",
+	}
+	if err != nil {
+		event.Error = telemetryError(err)
+	}
+	p.emit(ctx, event)
+}
+
+func telemetryStatus(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "cancelled"
+	}
+	return "error"
+}
+
+// telemetryError deliberately excludes provider response bodies, which can contain
+// user prompts or other sensitive data. Keep only a safe category and HTTP status.
+func telemetryError(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "context canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline exceeded"
+	}
+	if code := statusOf(err); code != 0 {
+		return fmt.Sprintf("provider status %d", code)
+	}
+	return "provider transport error"
 }
 
 // New builds a Pool over members (already in chain order). Returns nil when the
@@ -84,32 +148,46 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 	return func(yield func(llm.StreamEvent, error) bool) {
 		var lastErr error
 		for i, m := range order {
+			started := time.Now()
+			var usage llm.Usage
 			emitted := false
 			var failed error
 			for ev, err := range m.Prov.Stream(ctx, req) {
+				usage.Add(ev.Usage)
 				if err != nil && !emitted && shouldFailover(ctx, err) {
 					failed = err
 					break // safe window: nothing reached the caller yet
 				}
-				emitted = true
-				if !yield(ev, err) {
-					return // caller stopped consuming (cancel / early exit)
-				}
 				if err != nil {
-					return // terminal error already handed to the caller
+					p.health.Pass(m.ID)
+					p.emitAttempt(ctx, m, started, usage, err, "")
+					yield(ev, err)
+					return
+				}
+				emitted = true
+				if !yield(ev, nil) {
+					p.emitAttempt(ctx, m, started, usage, nil, "interrupted")
+					return // caller stopped consuming (cancel / early exit)
 				}
 			}
 			if failed == nil {
-				p.health.Pass(m.ID) // completed (or failed in a non-failover way)
+				p.health.Pass(m.ID)
+				status := "ok"
+				if ctx.Err() != nil {
+					status = "cancelled"
+				}
+				p.emitAttempt(ctx, m, started, usage, nil, status)
 				return
 			}
 			lastErr = failed
+			p.emitAttempt(ctx, m, started, usage, failed, "")
 			hard := isHardFailure(failed)
 			if p.health.Trip(m.ID, trimErr(failed), hard) {
 				log.Printf("[llmpool] configuration %q(%s) tripped the circuit breaker: %s", m.Name, m.Model, trimErr(failed))
 			}
 			if i+1 < len(order) {
 				n := order[i+1]
+				p.emitFallback(ctx, m, n, failed)
 				log.Printf("[llmpool] LLM failover: %q(%s) -> %q(%s), reason: %s",
 					m.Name, m.Model, n.Name, n.Model, trimErr(failed))
 			}
@@ -131,24 +209,29 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 	order := p.order(req)
 	var lastErr error
 	for i, m := range order {
+		started := time.Now()
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
 			p.health.Pass(m.ID)
+			p.emitAttempt(ctx, m, started, usage, nil, "ok")
 			return msg, sr, usage, nil
 		}
 		if !shouldFailover(ctx, err) {
 			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
 			// without tripping health, matching Stream's non-failover path.
 			p.health.Pass(m.ID)
+			p.emitAttempt(ctx, m, started, usage, err, "")
 			return llm.Message{}, "", llm.Usage{}, err
 		}
 		lastErr = err
+		p.emitAttempt(ctx, m, started, usage, err, "")
 		hard := isHardFailure(err)
 		if p.health.Trip(m.ID, trimErr(err), hard) {
 			log.Printf("[llmpool] configuration %q(%s) tripped the circuit breaker: %s", m.Name, m.Model, trimErr(err))
 		}
 		if i+1 < len(order) {
 			n := order[i+1]
+			p.emitFallback(ctx, m, n, err)
 			log.Printf("[llmpool] LLM failover: %q(%s) -> %q(%s), reason: %s",
 				m.Name, m.Model, n.Name, n.Model, trimErr(err))
 		}

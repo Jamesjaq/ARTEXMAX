@@ -14,6 +14,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
@@ -220,6 +221,7 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 }
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	ctx = llmpool.WithTelemetryContext(ctx, r.taskID, r.agentKey, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }
@@ -230,6 +232,7 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 // duplicated model output or tool execution (the "committed" bookkeeping the
 // streaming path needs is unnecessary here).
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	ctx = llmpool.WithTelemetryContext(ctx, r.taskID, r.agentKey, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }

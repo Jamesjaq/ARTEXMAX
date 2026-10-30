@@ -66,6 +66,11 @@ func (p PassiveProfile) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 			return fmt.Errorf("check %q has an unsafe URL", c.ID)
 		}
+		for key := range u.Query() {
+			if isSensitivePassiveName(key) {
+				return fmt.Errorf("check %q cannot include credential-like query parameter %q", c.ID, key)
+			}
+		}
 		if c.MaxBodyBytes <= 0 || c.MaxBodyBytes > MaxPassiveBodyBytes {
 			return fmt.Errorf("check %q body cap is outside bounds", c.ID)
 		}
@@ -73,12 +78,24 @@ func (p PassiveProfile) Validate() error {
 			return fmt.Errorf("check %q timeout is outside bounds", c.ID)
 		}
 		for key := range c.Headers {
-			if strings.EqualFold(key, "authorization") || strings.EqualFold(key, "cookie") || strings.EqualFold(key, "proxy-authorization") {
+			if isSensitivePassiveName(key) || strings.EqualFold(key, "proxy-authorization") || strings.EqualFold(key, "set-cookie") {
 				return fmt.Errorf("check %q cannot include credential header %q", c.ID, key)
 			}
 		}
 	}
 	return nil
+}
+
+func isSensitivePassiveName(name string) bool {
+	key := strings.ToLower(strings.TrimSpace(name))
+	key = strings.ReplaceAll(key, "-", "")
+	key = strings.ReplaceAll(key, "_", "")
+	switch key {
+	case "authorization", "cookie", "setcookie", "password", "passwd", "secret", "token", "accesstoken", "authtoken", "apikey", "xapikey", "session", "sessionid", "credential", "credentials":
+		return true
+	default:
+		return strings.HasSuffix(key, "apikey") || strings.HasSuffix(key, "token") || strings.HasSuffix(key, "secret")
+	}
 }
 
 func (p PassiveProfile) unsignedBytes() []byte {
@@ -131,10 +148,21 @@ func PassiveRequestKey(check PassiveCheck, authContext string) string {
 		}
 		return headers[i][0] < headers[j][0]
 	})
+	canonicalURL := check.URL
+	if parsed, err := url.Parse(check.URL); err == nil {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		parsed.Fragment = ""
+		parsed.RawQuery = parsed.Query().Encode()
+		canonicalURL = parsed.String()
+	}
 	canonical := struct {
 		Method, URL, Auth string
 		Headers           [][2]string
-	}{strings.ToUpper(check.Method), check.URL, authContext, headers}
+		MaxBodyBytes      int64
+		TimeoutMS         int
+		FollowRedirects   bool
+	}{strings.ToUpper(strings.TrimSpace(check.Method)), canonicalURL, authContext, headers, check.MaxBodyBytes, check.TimeoutMS, check.FollowRedirects}
 	raw, _ := json.Marshal(canonical)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])

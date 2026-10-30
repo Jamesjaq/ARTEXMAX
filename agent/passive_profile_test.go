@@ -31,6 +31,16 @@ func TestPassiveProfileRejectsActiveOrCredentialedChecks(t *testing.T) {
 	if err := p.Validate(); err == nil {
 		t.Fatal("credential header was accepted")
 	}
+	p = testPassiveProfile()
+	p.Checks[0].Headers = map[string]string{"X-Api-Key": "secret"}
+	if err := p.Validate(); err == nil {
+		t.Fatal("API-key header was accepted")
+	}
+	p = testPassiveProfile()
+	p.Checks[0].URL = "https://example.test/?access_token=secret"
+	if err := p.Validate(); err == nil {
+		t.Fatal("credential-like query parameter was accepted")
+	}
 }
 
 func TestPassiveRequestKeySeparatesAuthContexts(t *testing.T) {
@@ -44,5 +54,14 @@ func TestPassiveRequestKeySeparatesAuthContexts(t *testing.T) {
 	check.Headers = map[string]string{"accept": "text/html"}
 	if first != PassiveRequestKey(check, "anonymous") {
 		t.Fatal("header casing changed request identity")
+	}
+	check.MaxBodyBytes++
+	if first == PassiveRequestKey(check, "anonymous") {
+		t.Fatal("response cap mutation did not change request identity")
+	}
+	check = p.Checks[0]
+	check.FollowRedirects = true
+	if first == PassiveRequestKey(check, "anonymous") {
+		t.Fatal("redirect policy mutation did not change request identity")
 	}
 }
