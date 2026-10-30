@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestPassiveRunnerExecutesBoundedDeduplicatedChecks(t *testing.T) {
@@ -44,5 +45,55 @@ func TestPassiveRunnerRejectsRedirectWhenDisabled(t *testing.T) {
 	}
 	if len(obs) != 1 || obs[0].Status != "error" {
 		t.Fatalf("unexpected redirect observation: %+v", obs)
+	}
+}
+
+func TestPassiveRunnerPolicyDenialIsFailClosed(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer ts.Close()
+	p := PassiveProfile{Version: PassiveProfileVersion, ID: "denied", Engine: "test", Checks: []PassiveCheck{{ID: "a", Method: "GET", URL: ts.URL, MaxBodyBytes: 64, TimeoutMS: 1000}}}
+	if err := p.Sign([]byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewPassiveRunner(nil).RunAuthorized(context.Background(), p, []byte("secret"), "anonymous", Policy{
+		Revision:            "r1",
+		AllowedTools:        map[string]bool{"http_request": true},
+		AllowedCapabilities: map[string]bool{"http.read": true},
+		AllowedScopes:       []string{"other.example"},
+	}, PolicyUsage{}, nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Observations) != 1 || result.Observations[0].Status != "denied" || result.Decisions[0].Allowed {
+		t.Fatalf("unexpected denial result: %+v", result)
+	}
+	if calls != 0 {
+		t.Fatalf("denied request reached server: calls=%d", calls)
+	}
+}
+
+func TestPassiveRunnerPolicyAllowsExactAction(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	check := PassiveCheck{ID: "a", Method: "GET", URL: ts.URL, MaxBodyBytes: 64, TimeoutMS: 1000}
+	p := PassiveProfile{Version: PassiveProfileVersion, ID: "allowed", Engine: "test", Checks: []PassiveCheck{check}}
+	if err := p.Sign([]byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	policy := Policy{Revision: "r1", AllowedTools: map[string]bool{"http_request": true}, AllowedCapabilities: map[string]bool{"http.read": true}, AllowedScopes: []string{"127.0.0.1:*"}, MaxActions: 1}
+	result, err := NewPassiveRunner(nil).RunAuthorized(context.Background(), p, []byte("secret"), "anonymous", policy, PolicyUsage{}, nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Observations) != 1 || result.Observations[0].Status != "error" && result.Observations[0].Status != "ok" {
+		t.Fatalf("unexpected observation: %+v", result.Observations)
+	}
+	if len(result.Decisions) != 1 || !result.Decisions[0].Allowed || calls != 1 || result.Usage.Actions != 1 {
+		t.Fatalf("unexpected authorization result: %+v calls=%d", result, calls)
 	}
 }

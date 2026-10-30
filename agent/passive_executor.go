@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,15 @@ type httpDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// AuthorizedPassiveRun is the result of a policy-gated passive run. Decisions
+// are returned for every profile check, including checks denied before any
+// network request is made, so the caller can persist an auditable ledger event.
+type AuthorizedPassiveRun struct {
+	Observations []Observation
+	Decisions    []PolicyDecision
+	Usage        PolicyUsage
+}
+
 func NewPassiveRunner(client httpDoer) *PassiveRunner {
 	if client == nil {
 		client = &http.Client{}
@@ -33,6 +44,81 @@ func (r *PassiveRunner) Run(ctx context.Context, profile PassiveProfile, secret 
 	if err := profile.Verify(secret); err != nil {
 		return nil, err
 	}
+	return r.runVerified(ctx, profile, authContext, nil), nil
+}
+
+// RunAuthorized is the control-plane entry point for passive execution. Each
+// check is converted into the same typed Action contract used by other
+// executors and must pass EvaluateAction before the HTTP client is touched.
+// The legacy Run method remains available for callers that already perform
+// authorization outside this package; new orchestration code should use this
+// method so policy and observation events stay coupled.
+func (r *PassiveRunner) RunAuthorized(ctx context.Context, profile PassiveProfile, secret []byte, authContext string, policy Policy, usage PolicyUsage, approval *Approval, now time.Time) (AuthorizedPassiveRun, error) {
+	if err := profile.Verify(secret); err != nil {
+		return AuthorizedPassiveRun{}, err
+	}
+	if err := policy.Validate(); err != nil {
+		return AuthorizedPassiveRun{}, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	result := AuthorizedPassiveRun{
+		Observations: make([]Observation, 0, len(profile.Checks)),
+		Decisions:    make([]PolicyDecision, 0, len(profile.Checks)),
+		Usage:        usage,
+	}
+	for _, check := range profile.Checks {
+		action, err := passiveAction(check, authContext)
+		if err != nil {
+			return AuthorizedPassiveRun{}, err
+		}
+		decision := EvaluateAction(action, policy, result.Usage, approval, now)
+		result.Decisions = append(result.Decisions, decision)
+		if !decision.Allowed {
+			result.Observations = append(result.Observations, Observation{
+				ActionID:       check.ID,
+				Status:         "denied",
+				ErrorCode:      "policy_denied",
+				Summary:        decision.Reason,
+				Redacted:       true,
+				ProvenanceNote: "policy_digest=" + decision.ActionDigest,
+			})
+			continue
+		}
+		observations := r.runVerified(ctx, PassiveProfile{Checks: []PassiveCheck{check}}, authContext, &result.Usage)
+		result.Observations = append(result.Observations, observations...)
+	}
+	return result, nil
+}
+
+func passiveAction(check PassiveCheck, authContext string) (Action, error) {
+	u, err := url.Parse(check.URL)
+	if err != nil {
+		return Action{}, err
+	}
+	args, err := json.Marshal(struct {
+		Method  string            `json:"method"`
+		URL     string            `json:"url"`
+		Headers map[string]string `json:"headers,omitempty"`
+	}{strings.ToUpper(check.Method), check.URL, check.Headers})
+	if err != nil {
+		return Action{}, err
+	}
+	return Action{
+		ID:             check.ID,
+		Tool:           "http_request",
+		Arguments:      args,
+		TargetScope:    u.Host,
+		Capability:     "http.read",
+		TimeoutMS:      check.TimeoutMS,
+		IdempotencyKey: PassiveRequestKey(check, authContext),
+		ReadOnly:       true,
+		Idempotent:     true,
+	}, nil
+}
+
+func (r *PassiveRunner) runVerified(ctx context.Context, profile PassiveProfile, authContext string, usage *PolicyUsage) []Observation {
 	out := make([]Observation, 0, len(profile.Checks))
 	for _, check := range profile.Checks {
 		key := PassiveRequestKey(check, authContext)
@@ -47,8 +133,12 @@ func (r *PassiveRunner) Run(ctx context.Context, profile PassiveProfile, secret 
 		}
 		obs := r.runCheck(ctx, check)
 		out = append(out, obs)
+		if usage != nil {
+			usage.Actions++
+			usage.Bytes += obs.BytesRead
+		}
 	}
-	return out, nil
+	return out
 }
 
 func (r *PassiveRunner) runCheck(ctx context.Context, check PassiveCheck) Observation {

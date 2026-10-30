@@ -38,7 +38,13 @@ GET/HEAD/OPTIONS-only enforcement, credential-header rejection, bounded body
 and time limits, and authentication-aware request deduplication.
 The runner executes these profiles with per-request timeouts, response-size
 caps, redirect controls, normalized observations, truncation metadata, and
-per-run request deduplication.
+per-run request deduplication. `RunAuthorized` is now the typed policy-gated
+entry point: each check becomes an exact `http_request`/`http.read` action,
+`EvaluateAction` runs before the HTTP client is touched, denied checks produce
+auditable denied observations, and allowed checks update action/byte usage.
+The low-level `Run` method remains only for callers that already own an
+external authorization boundary; orchestration should migrate to
+`RunAuthorized`.
 
 ## End-to-end target architecture
 
