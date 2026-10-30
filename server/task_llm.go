@@ -223,7 +223,30 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	ctx = llmpool.WithTelemetryContext(ctx, r.taskID, r.agentKey, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	started := r.s.appendTaskRunEvent(r.taskID, r.agentKey, db.EventModelCallStarted, "started", 0, nil)
+	return func(yield func(llm.StreamEvent, error) bool) {
+		var totalTokens int
+		var callErr error
+		for event, err := range streamTaskLLM(ctx, r.taskID, req, r.streamHooks()) {
+			if err != nil {
+				callErr = err
+				yield(event, err)
+				break
+			}
+			totalTokens += event.Usage.InputTokens + event.Usage.OutputTokens
+			if !yield(event, nil) {
+				return
+			}
+		}
+		kind, status := db.EventModelCallCompleted, "completed"
+		if callErr != nil {
+			kind, status = db.EventModelCallFailed, "failed"
+		}
+		completed := r.s.appendTaskRunEvent(r.taskID, r.agentKey, kind, status, totalTokens, callErr)
+		if callErr == nil {
+			r.s.checkpointTaskRun(r.taskID, r.agentKey, "model_call", status, completedOrStarted(completed, started))
+		}
+	}
 }
 
 // Complete is the non-streaming counterpart of Stream. A non-streaming call is
@@ -234,7 +257,24 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	ctx = llmpool.WithTelemetryContext(ctx, r.taskID, r.agentKey, r.agentKey)
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	started := r.s.appendTaskRunEvent(r.taskID, r.agentKey, db.EventModelCallStarted, "started", 0, nil)
+	msg, stopReason, usage, err := completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	kind, status := db.EventModelCallCompleted, "completed"
+	if err != nil {
+		kind, status = db.EventModelCallFailed, "failed"
+	}
+	completed := r.s.appendTaskRunEvent(r.taskID, r.agentKey, kind, status, usage.InputTokens+usage.OutputTokens, err)
+	if err == nil {
+		r.s.checkpointTaskRun(r.taskID, r.agentKey, "model_call", status, completedOrStarted(completed, started))
+	}
+	return msg, stopReason, usage, err
+}
+
+func completedOrStarted(completed, started *db.RunEvent) *db.RunEvent {
+	if completed != nil {
+		return completed
+	}
+	return started
 }
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {

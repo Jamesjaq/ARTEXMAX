@@ -33,6 +33,9 @@ const (
 	EventCheckpointCreated   = "checkpoint_created"
 	EventCondensationCreated = "condensation_created"
 	EventRunStatusChanged    = "run_status_changed"
+	EventModelCallStarted    = "model_call_started"
+	EventModelCallCompleted  = "model_call_completed"
+	EventModelCallFailed     = "model_call_failed"
 )
 
 // AppendRunEvent writes one event exactly once when idempotencyKey is set.
