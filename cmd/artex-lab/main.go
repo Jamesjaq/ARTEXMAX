@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -11,15 +12,25 @@ import (
 
 func main() {
 	out := flag.String("out", "", "write the JSON report to this file instead of stdout")
+	full := flag.Bool("full", false, "run the isolated benign active-assessment fixture")
 	flag.Parse()
-	report, err := lab.Run(context.Background())
+	var data []byte
+	var err error
+	if *full {
+		report, runErr := lab.RunFull()
+		err = runErr
+		if err == nil {
+			data, err = json.MarshalIndent(report, "", "  ")
+		}
+	} else {
+		report, runErr := lab.Run(context.Background())
+		err = runErr
+		if err == nil {
+			data, err = report.JSON()
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "lab:", err)
-		os.Exit(1)
-	}
-	data, err := report.JSON()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "encode report:", err)
 		os.Exit(1)
 	}
 	data = append(data, '\n')
