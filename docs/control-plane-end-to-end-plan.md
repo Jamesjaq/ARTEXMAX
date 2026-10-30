@@ -46,6 +46,15 @@ The low-level `Run` method remains only for callers that already own an
 external authorization boundary; orchestration should migrate to
 `RunAuthorized`.
 
+The provider layer now also exposes explicit role routes (`reasoner`,
+`summarizer`, `extractor`, and `verifier`) and a concurrency-safe budget
+decorator. It reserves in-flight input/output capacity before a call, commits
+actual usage on completion, releases reservations on failure, and enforces
+token and microcurrency ceilings. The replay layer includes a deterministic
+run-event projection with duplicate ID/idempotency suppression, and the
+fixture episode harness exercises policy evaluation, bounded observation, and
+completion events against an authorized local target.
+
 ## End-to-end target architecture
 
 The runtime should follow this invariant:
@@ -195,7 +204,7 @@ Test with authorized fixture targets only:
 
 ### 7. Add provider routing and cost controls
 
-Extend `llmpool` with role-based model groups: reasoner, summarizer, extractor/classifier, verifier. Add capability/context-window filtering, bounded retries, explicit fallback groups, cooldowns, per-run and tenant budgets, and provider telemetry.
+Extend `llmpool` with role-based model groups: reasoner, summarizer, extractor/classifier, verifier. Add capability/context-window filtering, bounded retries, explicit fallback groups, cooldowns, per-run and tenant budgets, and provider telemetry. Role routing and a concurrency-safe token/cost budget decorator are implemented; server configuration and durable provider telemetry wiring remain.
 
 Record requested model group, served provider/model, attempt chain, latency, tokens, estimated cost, fallback reason, cache status, and policy decision. Do not use semantic caching for state-changing or context-sensitive security decisions by default.
 
@@ -225,7 +234,7 @@ Test:
 
 ### 9. Add a deterministic episode harness
 
-Create authorized fixture scenarios with pinned target snapshots, tool/profile versions, policy revisions, model configuration, seeds, and budgets. Persist every action, observation, policy decision, approval, artifact, token count, latency, and result.
+Create authorized fixture scenarios with pinned target snapshots, tool/profile versions, policy revisions, model configuration, seeds, and budgets. The first deterministic passive episode and replay projection are implemented; persistence-backed episode orchestration, restart injection, evidence export, and metric aggregation remain.
 
 Required metrics:
 
